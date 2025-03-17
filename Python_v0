@@ -1,0 +1,148 @@
+import pandas as pd
+import os
+from datetime import datetime, timedelta
+from openpyxl import Workbook
+
+############################################## INPUTS ##############################################
+####################################################################################################
+
+# Date to write
+# Set backup to True if creating copy of old master data to 00BACKUP folder, otherwise False
+# Select curves to write (True) or omit (False)
+
+val_date = datetime.strptime("1/31/2025", "%m/%d/%Y")
+
+backup = True
+
+CMC_select = True
+SAGEPPA_select = True
+FTSE_select = True
+UST_select = True
+UST_FTSE_select = True
+IRC430_select = True
+IRS_select = True
+
+############# Import list file #############
+
+main_directory = "L:/Liability Database"
+os.chdir(os.path.join(main_directory, "Lists"))
+master_list = pd.read_csv("Master List.csv", na_values=[""])
+
+############# Add file name column #############
+
+benchmark = master_list[master_list['Benchmark'].notna()]
+if not benchmark.empty:
+    benchmark['Benchmark'] = None
+master_list = pd.concat([master_list, benchmark])
+
+tranche_year = master_list['Tranche'].str[:-1].astype(int)
+tranche_id = master_list['Tranche'].str[-1]
+tranche_id = tranche_id.replace({'S': 'SHORT', 'L': 'LONG'})
+
+master_list['File_Name'] = master_list.apply(lambda x: ' '.join(x[['Symbol', tranche_id, tranche_year]].dropna().astype(str)), axis=1)
+master_list.loc[master_list['Benchmark'].notna(), 'File_Name'] = master_list['Benchmark']
+master_list['File_Name'] = master_list['File_Name'] + ".csv"
+master_list['File_Name2'] = val_date.strftime("%Y-%m-%d") + " " + master_list['File_Name']
+
+master_list.drop(columns=['Benchmark'], inplace=True)
+master_list['Data_Overwritten'] = ""
+master_list['Data_Added'] = ""
+master_list['Warnings'] = ""
+
+# Filter list by selected curves to run
+curves_select = [CMC_select, SAGEPPA_select, FTSE_select, UST_select, UST_FTSE_select, IRC430_select, IRS_select]
+curves_list = ["CMC", "SAGEPPA", "FTSE", "UST", "UST_FTSE", "IRC430", "IRS"]
+curves_subset = [curves_list[i] for i in range(len(curves_list)) if curves_select[i]]
+master_list = master_list[master_list['Curve'].isin(curves_subset)].reset_index(drop=True)
+
+update_report = []
+update_report.append(pd.DataFrame({
+    'Parameters': ["Valuation Date", "Backup"] + curves_list + ["Run Date"],
+    'Inputs': [val_date.strftime("%Y-%m-%d"), backup] + curves_select + [datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
+}))
+
+####################################### Write to Master Data #######################################
+####################################################################################################
+
+for a in range(len(master_list)):
+    
+    warnings = []
+    
+    ##### Import new data #####
+    
+    os.chdir(os.path.join(main_directory, "Monthly", val_date.strftime("%Y-%m-%d"), "Data", master_list.loc[a, 'Curve']))
+    
+    try:
+        data_import = pd.read_csv(master_list.loc[a, 'File_Name2'])
+    except:
+        warnings.append("skipped")
+        data_import = None
+
+    if data_import is not None:
+        
+        data_import['Date'] = pd.to_datetime(data_import['Date'], errors='coerce')
+        
+        ##### Import master data if it exists, else skip and create new data as master data #####
+        
+        os.chdir(os.path.join(main_directory, "Master Data", master_list.loc[a, 'Curve']))
+        
+        if os.path.exists(master_list.loc[a, 'File_Name']):
+            
+            master_import = pd.read_csv(master_list.loc[a, 'File_Name'])
+            master_import['Date'] = pd.to_datetime(master_import['Date'], errors='coerce')
+            
+            ### Copy old master data to 00BACKUP folder if selected
+            if backup:
+                os.makedirs(os.path.join(main_directory, "Master Data", "00BACKUP", master_list.loc[a, 'Curve']), exist_ok=True)
+                os.chdir(os.path.join(main_directory, "Master Data", "00BACKUP", master_list.loc[a, 'Curve']))
+                master_import.to_csv(master_list.loc[a, 'File_Name'], index=False, na_rep="")
+            
+            rows_overwrite = master_import['Date'].isin(data_import['Date'])
+            
+            old_data = master_import[rows_overwrite]
+            
+            preserve_data = old_data.iloc[:, 22:25]
+            
+            overwrite_data = data_import[data_import['Date'].isin(master_import['Date'])]
+            overwrite_data.iloc[:, 22:25] = preserve_data.values
+            
+            append_data = data_import[~data_import['Date'].isin(master_import['Date'])]
+            
+            master_update = pd.concat([master_import[~rows_overwrite], overwrite_data, append_data])
+            
+            ### Data update report ###
+            master_list.loc[a, 'Data_Overwritten'] = ', '.join(overwrite_data['Date'].astype(str))
+            master_list.loc[a, 'Data_Added'] = ', '.join(append_data['Date'].astype(str))
+            
+        else:
+            master_update = data_import
+            warnings.append("new data created")
+        
+        ##### Data update report #####
+        
+        date_check_1 = master_update['Date'].iloc[0] + timedelta(days=1)
+        date_check_2 = master_update['Date'].iloc[-1] + timedelta(days=1)
+        date_check_seq = pd.date_range(start=date_check_1, end=date_check_2, freq='M') - timedelta(days=1)
+        
+        if not all(date_check_seq == master_update['Date']):
+            warnings.append("bad date sequence")
+        
+        os.chdir(os.path.join(main_directory, "Master Data", master_list.loc[a, 'Curve']))
+        master_update.to_csv(master_list.loc[a, 'File_Name'], index=False, na_rep="")
+    
+    master_list.loc[a, 'Warnings'] = ', '.join(warnings)
+    
+    del data_import, master_import, master_update, old_data, preserve_data, overwrite_data, append_data
+
+update_report.append(master_list[['File_Name', 'Curve', 'Data_Overwritten', 'Data_Added', 'Warnings']])
+update_report[0].columns = ["Input Parameters", "Update Report"]
+
+os.chdir(os.path.join(main_directory, "Monthly", val_date.strftime("%Y-%m-%d")))
+
+x = 1
+while os.path.exists(f"Data Update Report {x}.xlsx"):
+    x += 1
+
+with pd.ExcelWriter(f"Data Update Report {x}.xlsx") as writer:
+    for i, df in enumerate(update_report):
+        df.to_excel(writer, sheet_name=f"Sheet{i+1}", index=False)
