@@ -1,0 +1,165 @@
+library(writexl)
+library(lubridate)
+
+############################################## INPUTS ##############################################
+####################################################################################################
+
+## Date to write
+## Set backup to T (TRUE) if creating copy of old master data to 00BACKUP folder, otherwise F (FALSE)
+# Select curves to write (T) or omit (F)
+
+val.date <- as.Date("1/31/2025", "%m/%d/%Y")
+
+backup <- T
+
+CMC.select <- T
+SAGEPPA.select <- T
+FTSE.select <- T
+UST.select <- T
+UST_FTSE.select <- T
+IRC430.select <- T
+IRS.select <- T
+
+############# Import list file #############
+
+main.directory <- "L:/Liability Database"
+setwd(file.path(main.directory, "Lists"))
+master.list <- read.csv("Master List.csv", na.strings = c(""))
+
+############# Add file name column #############
+
+benchmark <- master.list[!is.na(master.list$Benchmark),]
+if(nrow(benchmark) != 0)  benchmark$Benchmark <- NA
+master.list <- rbind(master.list, benchmark)
+
+tranche.year <- as.numeric(substr(master.list$Tranche, 1, nchar(master.list$Tranche)-1))
+tranche.id <- substr(master.list$Tranche, nchar(master.list$Tranche), nchar(master.list$Tranche))
+tranche.id[tranche.id %in% "S"] <- "SHORT"
+tranche.id[tranche.id %in% "L"] <- "LONG"
+
+master.list$File_Name <- apply(cbind(master.list$Symbol, tranche.id, tranche.year), 1, 
+                                     function(x) paste(x[!is.na(x)], collapse = " "))
+master.list$File_Name[!is.na(master.list$Benchmark)] <- master.list$Benchmark[!is.na(master.list$Benchmark)]
+master.list$File_Name <- paste0(master.list$File_Name, ".csv")
+master.list$File_Name2 <- paste0(val.date, " ", master.list$File_Name)
+
+master.list$Benchmark <- NULL
+master.list$Data_Overwritten <- ""
+master.list$Data_Added <- ""
+master.list$Warnings <- ""
+
+# Filter list by selected curves to run
+curves.select <- c(CMC.select, SAGEPPA.select, FTSE.select, UST.select, UST_FTSE.select, IRC430.select, IRS.select)
+curves.list <- c("CMC", "SAGEPPA", "FTSE", "UST", "UST_FTSE", "IRC430", "IRS")
+curves.subset <- curves.list[curves.select]
+master.list <- master.list[master.list$Curve %in% curves.subset,]
+rownames(master.list) <- NULL
+
+update.report <- list()
+update.report[[1]] <- data.frame(Parameters = c("Valuation Date", "Backup", curves.list, "Run Date"),
+                                 Inputs = c(as.character(val.date), backup, curves.select, as.character(Sys.time())))
+
+
+
+####################################### Write to Master Data #######################################
+####################################################################################################
+
+for(a in 1:nrow(master.list)) {
+  
+  warnings <- NULL
+  
+  ##### Import new data #####
+  
+  setwd(file.path(main.directory, "Monthly", val.date, "Data", master.list$Curve[a]))
+  
+  
+  
+  data.import <- tryCatch(suppressWarnings(read.csv(master.list$File_Name2[a])),
+                          error = function(e) return(FALSE))
+
+  if(!is.data.frame(data.import)) {
+    warnings <- "skipped"
+    
+  } else {
+    
+    data.import$Date <- parse_date_time(data.import$Date, orders = c("mdy", "ymd"))
+    
+    ##### Import master data if it exists, else skip and create new data as master data #####
+    
+    setwd(file.path(main.directory, "Master Data", master.list$Curve[a]))
+    
+    if(file.exists(master.list$File_Name[a])){
+      
+      master.import <- read.csv(master.list$File_Name[a])
+      master.import$Date <- parse_date_time(master.import$Date, orders = c("mdy", "ymd"))
+      
+      ### Copy old master data to 00BACKUP folder if selected
+      if(backup) {
+        dir.create(file.path(main.directory, "Master Data", "00BACKUP", master.list$Curve[a]), showWarnings = FALSE)
+        setwd(file.path(main.directory, "Master Data", "00BACKUP", master.list$Curve[a]))
+        write.csv(master.import, file = master.list$File_Name[a], row.names = FALSE, na = "") 
+      }
+      
+      rows.overwrite <- master.import$Date %in% data.import$Date
+      
+      old.data <- master.import[rows.overwrite,]
+      
+      preserve.data <- old.data[, 23:25]
+      
+      overwrite.data <- data.import[data.import$Date %in% master.import$Date,]
+      overwrite.data[, 23:25] <- preserve.data
+      
+      append.data <- data.import[!(data.import$Date %in% master.import$Date),]
+      
+      master.update <- master.import[!rows.overwrite, ]
+      master.update <- rbind(master.update, overwrite.data, append.data)
+      
+      ### Data update report ###
+      master.list$Data_Overwritten[a] <- paste(overwrite.data$Date, collapse = ', ')
+      master.list$Data_Added[a] <- paste(append.data$Date, collapse = ', ')
+      
+    } else {
+      master.update <- data.import
+      warnings <- "new data created"
+    }
+    
+    
+    
+    ##### Data update report #####
+    
+    date.check.1 <- master.update$Date[1] + days(1)
+    date.check.2 <- master.update$Date[nrow(master.update)] + days(1)
+    date.check.seq <- seq(from = date.check.1, to = date.check.2, by = "month") - days(1)
+    
+    if(!all(date.check.seq == master.update$Date)) warnings <- c(warnings, "bad date sequence")
+    
+    
+    
+    setwd(file.path(main.directory, "Master Data", master.list$Curve[a]))
+    write.csv(master.update, master.list$File_Name[a], row.names = FALSE, na = "")
+    
+  }
+  
+  
+  master.list$Warnings[a] <- paste(warnings, collapse = ', ')
+  
+  
+  rm(list = ls()[!(ls() %in% c("master.list", 
+                               "a", 
+                               "main.directory", 
+                               "val.date",
+                               "backup",
+                               "update.report"))])
+}
+
+
+update.report[[2]] <- master.list[,c(6,2,8:10)]
+names(update.report) <- c("Input Parameters", "Update Report")
+
+
+setwd(file.path(main.directory, "Monthly", val.date))
+
+x <- 1
+while(file.exists(paste0("Data Update Report ", x, ".xlsx")))  x <- x + 1
+
+write_xlsx(update.report, paste0("Data Update Report ", x, ".xlsx"))
