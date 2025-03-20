@@ -146,3 +146,196 @@ while os.path.exists(f"Data Update Report {x}.xlsx"):
 with pd.ExcelWriter(f"Data Update Report {x}.xlsx") as writer:
     for i, df in enumerate(update_report):
         df.to_excel(writer, sheet_name=f"Sheet{i+1}", index=False)
+
+
+
+
+
+import os
+import pandas as pd
+from pathlib import Path
+from datetime import datetime, timedelta
+import shutil
+from openpyxl import Workbook
+
+############################################## INPUTS ##############################################
+####################################################################################################
+
+# Date to write
+# Set backup to True if creating a copy of old master data to '00BACKUP' folder, otherwise False
+# Select curves to write (True) or omit (False)
+
+val_date = datetime.strptime("1/31/2025", "%m/%d/%Y")   # Define the valuation date
+backup = True
+
+# Select curves
+curves_select = {
+    "CMC": True,
+    "SAGEPPA": True,
+    "FTSE": True,
+    "UST": True,
+    "UST_FTSE": True,
+    "IRC430": True,
+    "IRS": True
+}
+
+# Define main directory
+main_directory = Path("L:/Liability Database")
+
+# Load master list
+master_list_path = main_directory / "Lists" / "Master List.csv"
+master_list = pd.read_csv(master_list_path, na_values=[""])
+
+############################################## PREPARE FILE NAMES ##############################################
+
+# Separate rows where Benchmark is NOT NULL
+benchmark = master_list.loc[master_list['Benchmark'].notna()].copy()
+if not benchmark.empty:
+    benchmark['Benchmark'] = None
+
+# Append back to master_list
+master_list = pd.concat([master_list, benchmark], ignore_index=True)
+
+# Create tranche year and id
+master_list['Tranche_Year'] = master_list['Tranche'].str[:-1].astype(float)  # Year part
+master_list['Tranche_ID'] = master_list['Tranche'].str[-1]
+
+# Map tranche id to readable terms
+master_list['Tranche_ID'] = master_list['Tranche_ID'].replace({'S': 'SHORT', 'L': 'LONG'})
+
+# Create file names
+def create_file_name(row):
+    parts = [row['Symbol'], row['Tranche_ID'], row['Tranche_Year']]
+    parts = [str(p) for p in parts if pd.notna(p)]   # Filter out missing values
+    file_name = " ".join(parts) + ".csv"
+    return file_name
+
+master_list['File_Name'] = master_list.apply(create_file_name, axis=1)
+
+# If Benchmark is present, use that as File_Name
+master_list.loc[master_list['Benchmark'].notna(), 'File_Name'] = master_list['Benchmark']
+
+# Create final file names with valuation date prefix
+master_list['File_Name2'] = val_date.strftime("%Y-%m-%d") + " " + master_list['File_Name']
+
+# Clean up unneeded columns
+master_list.drop(['Benchmark'], axis=1, inplace=True)
+
+# Add status columns
+master_list['Data_Overwritten'] = ""
+master_list['Data_Added'] = ""
+master_list['Warnings'] = ""
+
+############################################## FILTER CURVES ##############################################
+
+# Filter based on selected curves
+curves_list = list(curves_select.keys())
+selected_curves = [curve for curve, selected in curves_select.items() if selected]
+master_list = master_list[master_list['Curve'].isin(selected_curves)].reset_index(drop=True)
+
+############################################## CREATE REPORT ##############################################
+
+update_report = []
+
+# Initial report with inputs
+update_report.append(pd.DataFrame({
+    "Parameters": ["Valuation Date", "Backup"] + curves_list + ["Run Date"],
+    "Inputs": [val_date.strftime("%Y-%m-%d"), backup] + [curves_select[c] for c in curves_list] + [datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
+}))
+
+############################################## WRITE TO MASTER DATA ##############################################
+
+for idx, row in master_list.iterrows():
+    warnings = []
+    curve = row['Curve']
+    file_name = row['File_Name']
+    file_name2 = row['File_Name2']
+
+    # Path to data
+    data_path = main_directory / "Monthly" / val_date.strftime("%Y-%m-%d") / "Data" / curve
+
+    try:
+        # Import new data
+        data_import = pd.read_csv(data_path / file_name2)
+        data_import['Date'] = pd.to_datetime(data_import['Date'], errors='coerce')
+
+        # Path to master data
+        master_data_path = main_directory / "Master Data" / curve
+        master_file = master_data_path / file_name
+
+        if master_file.exists():
+            master_import = pd.read_csv(master_file)
+            master_import['Date'] = pd.to_datetime(master_import['Date'], errors='coerce')
+
+            # Backup old data if required
+            if backup:
+                backup_path = main_directory / "Master Data" / "00BACKUP" / curve
+                backup_path.mkdir(parents=True, exist_ok=True)
+                shutil.copy(master_file, backup_path / file_name)
+
+            # Overwrite data
+            overwrite_mask = master_import['Date'].isin(data_import['Date'])
+
+            if overwrite_mask.any():
+                old_data = master_import.loc[overwrite_mask, :]
+                preserved_data = old_data.iloc[:, 22:25]  # Columns 23-25 (0-indexed)
+                
+                overwrite_data = data_import.loc[data_import['Date'].isin(master_import['Date']), :]
+                overwrite_data.iloc[:, 22:25] = preserved_data.values
+
+                append_data = data_import.loc[~data_import['Date'].isin(master_import['Date']), :]
+
+                # Combine into master update
+                master_update = pd.concat([master_import.loc[~overwrite_mask, :], overwrite_data, append_data])
+
+                # Add to report
+                row['Data_Overwritten'] = ", ".join(overwrite_data['Date'].astype(str))
+                row['Data_Added'] = ", ".join(append_data['Date'].astype(str))
+            else:
+                master_update = data_import
+                warnings.append("new data created")
+
+            # Check date sequence
+            expected_dates = pd.date_range(start=master_update['Date'].iloc[0] + timedelta(days=1),
+                                           end=master_update['Date'].iloc[-1] + timedelta(days=1),
+                                           freq='MS') - timedelta(days=1)
+            if not expected_dates.equals(master_update['Date']):
+                warnings.append("bad date sequence")
+
+            # Save master update
+            master_update.to_csv(master_file, index=False)
+
+        else:
+            master_update = data_import
+            warnings.append("new data created")
+
+            # Save to master
+            master_update.to_csv(master_file, index=False)
+
+        # Save warnings
+        row['Warnings'] = ", ".join(warnings)
+
+    except Exception as e:
+        row['Warnings'] = str(e)
+
+# Update master list
+update_report.append(master_list[['Curve', 'File_Name', 'Data_Overwritten', 'Data_Added', 'Warnings']])
+
+# Save report
+report_path = main_directory / "Monthly" / val_date.strftime("%Y-%m-%d")
+report_path.mkdir(parents=True, exist_ok=True)
+
+# Find next available report file name
+x = 1
+while (report_path / f"Data Update Report {x}.xlsx").exists():
+    x += 1
+
+report_file = report_path / f"Data Update Report {x}.xlsx"
+
+# Write report to Excel
+with pd.ExcelWriter(report_file, engine='openpyxl') as writer:
+    update_report[0].to_excel(writer, sheet_name='Input Parameters', index=False)
+    update_report[1].to_excel(writer, sheet_name='Update Report', index=False)
+
+print(f"Report saved to: {report_file}")
+
